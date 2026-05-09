@@ -1,8 +1,8 @@
 package store
 
 type Data struct {
-	CurrentTerm int `json:"current_term"`
-	VotedFor    int `json:"voted_for"`
+	CurrentTerm int    `json:"current_term"` // Latest term server has seen.
+	VotedFor    string `json:"voted_for"`    // Who received vote in curent term. Can be empty if none.
 
 	Log []LogEntry `json:"log"`
 }
