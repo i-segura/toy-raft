@@ -9,14 +9,14 @@ type Server struct {
 	httpServer *http.Server
 }
 
-func New(addr string) *Server {
+func New(addr string, handler http.Handler) *Server {
 
 	s := &Server{
 		httpServer: &http.Server{
 			Addr: addr,
 		},
 	}
-	s.httpServer.Handler = &Handler{}
+	s.httpServer.Handler = handler
 	return s
 }
 
@@ -26,12 +26,4 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() error {
 	return s.httpServer.Shutdown(context.Background())
-}
-
-type Handler struct {
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Hello, World!"))
 }
