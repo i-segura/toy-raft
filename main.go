@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/i-segura/toy-raft/raft"
+	raftServer "github.com/i-segura/toy-raft/raft/server"
 	"github.com/i-segura/toy-raft/server"
 )
 
@@ -31,7 +31,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("Starting raft server on port %d", args.raftPort)
-	raftServer := server.New(fmt.Sprintf("0.0.0.0:%d", args.raftPort), &raft.Handler{})
+	raftServer := server.New(fmt.Sprintf("0.0.0.0:%d", args.raftPort), &raftServer.Handler{})
 
 	setupSignals(raftServer)
 

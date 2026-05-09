@@ -12,11 +12,6 @@ const Follower Role = 1
 const Candidate Role = 2
 const Leader Role = 3
 
-type LogEntry struct {
-	Term    int64
-	Command interface{}
-}
-
 type State struct {
 	role Role
 

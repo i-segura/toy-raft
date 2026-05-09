@@ -1,8 +1,10 @@
 package protocol
 
 const (
-	RequestVoteRequestMagicNumber    = 0x01
-	RequestVoteResponseMagicNumber   = 0x02
-	AppendEntriesRequestMagicNumber  = 0x03
-	AppendEntriesResponseMagicNumber = 0x04
+	ErrorMagicNumber = 0x01
+
+	RequestVoteRequestMagicNumber    = 0x11
+	RequestVoteResponseMagicNumber   = 0x12
+	AppendEntriesRequestMagicNumber  = 0x13
+	AppendEntriesResponseMagicNumber = 0x14
 )
