@@ -22,7 +22,7 @@ type State struct {
 	leaderNextIndex  map[string]int
 	leaderMatchIndex map[string]int
 
-	store store.Store // Contains log and persistent state.
+	store *store.Store // Contains log and persistent state.
 
 	opCh chan<- operation
 }
@@ -42,8 +42,18 @@ type LeaderSnapShot struct {
 	LeaderMatchIndex map[string]int // Index of highest log entry known replicated on each server.
 }
 
-func (s *State) New(ctx context.Context, store *store.Store) *State {
+func New(ctx context.Context, store *store.Store) *State {
 	opCh := make(chan operation)
+	s := &State{
+		role:             Follower,
+		currentLeader:    "",
+		commitIndex:      0,
+		leaderNextIndex:  map[string]int{},
+		leaderMatchIndex: map[string]int{},
+		store:            store,
+		opCh:             opCh,
+	}
+
 	go func() {
 		for {
 			select {
@@ -55,15 +65,7 @@ func (s *State) New(ctx context.Context, store *store.Store) *State {
 		}
 	}()
 
-	return &State{
-		role:             Follower,
-		currentLeader:    "",
-		commitIndex:      0,
-		leaderNextIndex:  map[string]int{},
-		leaderMatchIndex: map[string]int{},
-		store:            *store,
-		opCh:             opCh,
-	}
+	return s
 }
 
 func (s *State) Snapshot() StateSnapshot {
@@ -89,20 +91,21 @@ func (s *State) LeaderSnapshot() LeaderSnapShot {
 func (s *State) EntryTerm(idx int) int {
 	snap := s.store.Snapshot()
 
-	if len(snap.Log) <= idx {
+	if idx < 0 || len(snap.Log) <= idx {
 		return 0
 	}
 
 	return snap.Log[idx].Term
 }
 
-func (s *State) BecomeFollower(term int) error {
+func (s *State) BecomeFollower(leader string, term int) error {
 	errCh := make(chan error)
 
 	s.opCh <- operation{
-		type_: BecomeFollower,
-		term:  term,
-		errCh: errCh,
+		type_:  BecomeFollower,
+		term:   term,
+		peerId: leader,
+		errCh:  errCh,
 	}
 
 	return <-errCh

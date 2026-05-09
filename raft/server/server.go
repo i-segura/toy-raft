@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -11,25 +10,25 @@ import (
 )
 
 type Handler struct {
-	onRequestVote   func(protocol.RequestVoteRequest) (*protocol.RequestVoteResponse, *protocol.Error)
-	onAppendEntries func(protocol.AppendEntriesRequest) (*protocol.AppendEntriesResponse, *protocol.Error)
+	OnRequestVote   func(protocol.RequestVoteRequest) (*protocol.RequestVoteResponse, *protocol.Error)
+	OnAppendEntries func(protocol.AppendEntriesRequest) (*protocol.AppendEntriesResponse, *protocol.Error)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		if err := respondError(w, protocolError("invalid HTTP method"), 403); err != nil {
-			log.Printf("error responding client: %w", err)
+			log.Printf("error responding client: %s", err)
 		}
 	}
 
 	magic := make([]byte, 1)
 	_, err := r.Body.Read(magic)
 	if err != nil {
-		log.Printf("error reading request: %w", err)
+		log.Printf("error reading request: %s", err)
 	}
 
 	if err = h.handleMessage(magic, r.Body, w); err != nil {
-		log.Printf("error handling request: %w", err)
+		log.Printf("error handling request: %s", err)
 	}
 }
 
@@ -37,22 +36,34 @@ func (h *Handler) handleMessage(magic []byte, r io.Reader, w http.ResponseWriter
 	switch magic[0] {
 	case protocol.RequestVoteRequestMagicNumber:
 		requestVote := protocol.RequestVoteRequest{}
-		err := json.NewDecoder(io.MultiReader(bytes.NewBuffer(magic), r)).Decode(&requestVote)
+		b, err := io.ReadAll(io.MultiReader(bytes.NewBuffer(magic), r))
+		if err != nil {
+			return respondError(w, protocolError("error reading message"), 400)
+		}
+
+		err = requestVote.Deserialize(b)
 		if err != nil {
 			return respondError(w, protocolError("malformed request vote request"), 400)
 		}
-		res, errCause := h.onRequestVote(requestVote)
+
+		res, errCause := h.OnRequestVote(requestVote)
 		if errCause != nil {
 			return respondError(w, *errCause, 400)
 		}
 		return respondOk(w, res)
 	case protocol.AppendEntriesRequestMagicNumber:
 		appendEntry := protocol.AppendEntriesRequest{}
-		err := json.NewDecoder(io.MultiReader(bytes.NewBuffer(magic), r)).Decode(&appendEntry)
+		b, err := io.ReadAll(io.MultiReader(bytes.NewBuffer(magic), r))
+		if err != nil {
+			return respondError(w, protocolError("error reading message"), 400)
+		}
+
+		err = appendEntry.Deserialize(b)
 		if err != nil {
 			return respondError(w, protocolError("malformed append entry request"), 400)
 		}
-		res, errCause := h.onAppendEntries(appendEntry)
+
+		res, errCause := h.OnAppendEntries(appendEntry)
 		if errCause != nil {
 			return respondError(w, *errCause, 400)
 		}

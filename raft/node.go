@@ -57,13 +57,18 @@ func New(params NodeParams) *Node {
 
 func (n *Node) Start() {
 	for {
+		s := n.state.Snapshot()
 		select {
 		case <-n.electionTimer.C:
-			if n.state.Snapshot().Role == state.Leader {
+			if s.Role == state.Leader {
 				n.electionTimer.Reset(n.electionTimeout)
+				continue
 			}
 			n.startElection()
 		case <-n.leaderHeartbeatTimer.C:
+			if s.Role != state.Leader {
+				continue
+			}
 			n.heartbeatFollowers()
 		}
 	}
@@ -72,18 +77,20 @@ func (n *Node) Start() {
 func (n *Node) HandleAppendEntry(req protocol.AppendEntriesRequest) (*protocol.AppendEntriesResponse, *protocol.Error) {
 	state := n.state.Snapshot()
 	if req.Term < state.CurrentTerm {
+		log.Printf("%s request denied: current term %d, their term %d", state.CurrentTerm, req.Term)
 		return &protocol.AppendEntriesResponse{
 			Term:    state.CurrentTerm,
 			Success: false,
 		}, nil
 	}
 
-	err := n.state.BecomeFollower(req.Term)
+	err := n.state.BecomeFollower(req.LeaderID, req.Term)
 	if err != nil {
 		return nil, &protocol.Error{
 			Cause: "state error",
 		}
 	}
+
 	n.electionTimer.Reset(n.electionTimeout)
 	if req.Term > state.CurrentTerm {
 		state.CurrentTerm = req.Term
@@ -121,34 +128,42 @@ func (n *Node) HandleAppendEntry(req protocol.AppendEntriesRequest) (*protocol.A
 func (n *Node) HandleRequestVote(req protocol.RequestVoteRequest) (*protocol.RequestVoteResponse, *protocol.Error) {
 	state := n.state.Snapshot()
 	if req.Term < state.CurrentTerm {
+		log.Printf("%s request denied: current term %d, their term %d", state.CurrentTerm, req.Term)
 		return &protocol.RequestVoteResponse{
 			Term:        state.CurrentTerm,
 			VoteGranted: false,
 		}, nil
+	}
+	if req.Term > state.CurrentTerm {
+		state.CurrentTerm = req.Term
 	}
 
 	votedForNullOrCandidateID := state.VotedFor == "" || state.VotedFor == req.CandidateID
 	grantVote := votedForNullOrCandidateID && state.CommitIndex <= req.LastLogIndex
 	if grantVote {
 		err := n.state.CastVote(req.Term, req.CandidateID)
+		n.electionTimer.Reset(n.electionTimeout)
 		if err != nil {
 			return nil, &protocol.Error{
 				Cause: "state error",
 			}
 		}
-		n.electionTimer.Reset(n.electionTimeout)
+
+		log.Printf("%s voted for %s", n.id, req.CandidateID)
 	} else {
 		// NOTE: Force term update.
-		err := n.state.CastVote(req.Term, state.VotedFor)
+		err := n.state.CastVote(req.Term, "")
+		n.electionTimer.Reset(n.electionTimeout)
 		if err != nil {
 			return nil, &protocol.Error{
 				Cause: "state error",
 			}
 		}
+		log.Printf("%s vote denied for %s", n.id, req.CandidateID)
 	}
 
 	return &protocol.RequestVoteResponse{
-		Term:        req.Term,
+		Term:        state.CurrentTerm,
 		VoteGranted: grantVote,
 	}, nil
 }
@@ -174,17 +189,19 @@ func (n *Node) heartbeatFollowers() {
 				Entries:      []any{},
 			})
 			if err != nil {
-				log.Printf("error appending entries: %w", err)
+				log.Printf("error appending entries: %s", err)
 				return
 			}
+			log.Printf("%s append entry response", n.id)
 
 			if res.Term > state.CurrentTerm {
-				err := n.state.BecomeFollower(res.Term)
+				err := n.state.BecomeFollower("", res.Term)
 				if err != nil {
-					log.Printf("error setting current term: %w", err)
+					log.Printf("error setting current term: %s", err)
 					return
 				}
 				n.electionTimer.Reset(n.electionTimeout)
+				log.Printf("%s became follower", n.id)
 			}
 
 			if !res.Success {
@@ -197,10 +214,11 @@ func (n *Node) heartbeatFollowers() {
 }
 
 func (n *Node) startElection() {
+	log.Printf("%s start election", n.id)
 
 	err := n.state.BecomeCandidate(n.id)
 	if err != nil {
-		log.Printf("error starting election: %w", err)
+		log.Printf("error starting election: %s", err)
 	}
 	n.electionTimer.Reset(n.electionTimeout)
 
@@ -208,32 +226,31 @@ func (n *Node) startElection() {
 	lastCommitTerm := n.state.EntryTerm(state.CommitIndex - 1)
 	responses := map[string]bool{}
 
-	wg := sync.WaitGroup{}
 	for id, peer := range n.peers {
-		wg.Go(func() {
-			res, err := peer.RequestVote(protocol.RequestVoteRequest{
-				Term:         state.CurrentTerm,
-				CandidateID:  n.id,
-				LastLogIndex: state.CommitIndex,
-				LastLogTerm:  lastCommitTerm,
-			})
+		res, err := peer.RequestVote(protocol.RequestVoteRequest{
+			Term:         state.CurrentTerm,
+			CandidateID:  n.id,
+			LastLogIndex: state.CommitIndex,
+			LastLogTerm:  lastCommitTerm,
+		})
+		if err != nil {
+			log.Printf("error requesting vote: %s", err)
+			return
+		}
+		log.Printf("%s vote response from %s", n.id, id)
+
+		if res.Term > state.CurrentTerm {
+			err := n.state.BecomeFollower("", res.Term)
 			if err != nil {
-				log.Printf("error requesting vote: %w", err)
+				log.Printf("error setting current term: %s", err)
 				return
 			}
+			log.Printf("%s became follower", n.id)
+			return
+		}
 
-			if res.Term > state.CurrentTerm {
-				err := n.state.BecomeFollower(res.Term)
-				if err != nil {
-					log.Printf("error setting current term: %w", err)
-					return
-				}
-			}
-
-			responses[id] = res.VoteGranted
-		})
+		responses[id] = res.VoteGranted
 	}
-	wg.Wait()
 
 	quorum := 0
 	for _, granted := range responses {
@@ -241,10 +258,12 @@ func (n *Node) startElection() {
 			continue
 		}
 		quorum++
-		if quorum > len(n.peers)/2 {
-			log.Printf("%s became leader", n.id)
+		if quorum >= len(n.peers)/2 {
 			n.state.BecomeLeader(n.id)
+			log.Printf("%s became leader", n.id)
 			n.heartbeatFollowers()
+			return
 		}
 	}
+	log.Printf("%s candidate did not receive enough votes: %d/%d", n.id, quorum, len(n.peers)/2)
 }

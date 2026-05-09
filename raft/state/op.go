@@ -47,7 +47,7 @@ func (s *State) handleOperation(op operation) {
 }
 
 func (s *State) becomeFollowerOperation(op operation) {
-	s.currentLeader = ""
+	s.currentLeader = op.peerId
 	s.role = Follower
 	s.leaderMatchIndex = map[string]int{}
 	s.leaderNextIndex = map[string]int{}
@@ -70,11 +70,6 @@ func (s *State) becomeLeaderOperation(op operation) {
 }
 
 func (s *State) castVoteOperation(op operation) {
-	if op.peerId == s.store.Snapshot().VotedFor {
-		op.errCh <- nil
-		return
-	}
-
 	op.errCh <- s.store.WriteVotedFor(op.term, op.peerId)
 }
 

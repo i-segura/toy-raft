@@ -14,8 +14,10 @@ type Client struct {
 	address string
 }
 
-func NewClient() *Client {
-	return &Client{}
+func NewClient(address string) *Client {
+	return &Client{
+		address: fmt.Sprintf("http://%s", address),
+	}
 }
 
 func (c *Client) RequestVote(req protocol.RequestVoteRequest) (*protocol.RequestVoteResponse, error) {
@@ -60,11 +62,11 @@ func sendPost[R any](c *Client, req canSerialize, res *R) (*R, error) {
 		return nil, err
 	}
 
-	if err = json.Unmarshal(rawRes, &res); err != nil {
+	if err = json.Unmarshal(rawRes[1:], &res); err != nil {
 		errMsg := protocol.Error{}
-		err := json.Unmarshal(rawRes, &err)
+		err := json.Unmarshal(rawRes[1:], &err)
 		if err != nil {
-			return nil, fmt.Errorf("unknown server response")
+			return nil, fmt.Errorf("unknown server response: %w", err)
 		}
 		return nil, fmt.Errorf("protocol error: %s", errMsg.Cause)
 	}

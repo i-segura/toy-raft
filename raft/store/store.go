@@ -15,14 +15,17 @@ type Store struct {
 func New(path string) (*Store, error) {
 	p := &Store{
 		path: path,
-		data: Data{},
+		data: Data{
+			CurrentTerm: 0,
+			VotedFor:    "",
+			Log:         []LogEntry{},
+		},
 	}
 
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		raw = []byte("{}")
-	}
-	if err != nil {
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -75,14 +78,12 @@ func (s *Store) WriteEntries(idx int, entries ...LogEntry) error {
 		}
 
 		s.data.Log = append(s.data.Log[:idx+replayIdx], entries[replayIdx:]...)
-		return persist(s.path, &s.data)
 	}
-
-	return nil
+	return persist(s.path, &s.data)
 }
 
 func persist(path string, data *Data) error {
-	fil, err := os.Open(path)
+	fil, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}

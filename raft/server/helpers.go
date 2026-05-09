@@ -30,9 +30,9 @@ func respondSerializeJson(w http.ResponseWriter, s canSerialize, code int) error
 
 	w.Header().Add("Content-Type", "application/json")
 	if _, err = io.Copy(w, bytes.NewBuffer(raw)); err != nil {
-		return fmt.Errorf("error writing response: %w", err)
+		w.WriteHeader(500)
+		return fmt.Errorf("error writing response: %s", err)
 	}
-	w.WriteHeader(code)
 	return nil
 }
 
