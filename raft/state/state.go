@@ -24,8 +24,16 @@ type State struct {
 
 }
 
+func (s *State) GetCurrentLeader() string {
+	return s.currentLeader
+}
+
 func (s *State) SetCurrentLeader(leader string) {
 	s.currentLeader = leader
+}
+
+func (s *State) GetRole() Role {
+	return s.role
 }
 
 func (s *State) SetRole(role Role) {
@@ -68,6 +76,32 @@ func (s *State) CommitIndex() int {
 // Update last commit index.
 func (s *State) SetCommitIndex(idx int) {
 	s.commitIndex = idx
+}
+
+// Get peer next index or 1 if none.
+func (s *State) GetPeerNextIndex(peer string) int {
+	idx, ok := s.leaderNextIndex[peer]
+	if !ok {
+		return 1
+	}
+	return idx
+}
+
+func (s *State) SetPeerNextIndex(peer string, idx int) {
+	s.leaderNextIndex[peer] = idx
+}
+
+// Get peer next index or zero if none.
+func (s *State) GetPeerCurrentIndex(peer string) int {
+	idx, ok := s.leaderMatchIndex[peer]
+	if !ok {
+		return 0
+	}
+	return idx
+}
+
+func (s *State) SetPeerCurrentIndex(peer string, idx int) {
+	s.leaderMatchIndex[peer] = idx
 }
 
 // Append new entry to the log and return its index.
