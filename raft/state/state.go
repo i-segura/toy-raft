@@ -1,6 +1,9 @@
 package state
 
 import (
+	"context"
+	"maps"
+
 	"github.com/i-segura/toy-raft/raft/store"
 )
 
@@ -13,116 +16,175 @@ const Leader Role = 3
 type State struct {
 	role Role
 
-	currentLeader string // Current leader.
-	commitIndex   int    // Index of highest log entry known to be commited.
-	lastApplied   int    // Index of highest log entry applied.
+	currentLeader string
+	commitIndex   int
 
-	leaderNextIndex  map[string]int // Index of the next log to send to each server.
-	leaderMatchIndex map[string]int // Index of highest log entry known replicated on each server.
+	leaderNextIndex  map[string]int
+	leaderMatchIndex map[string]int
 
-	store store.Store // Contains log and persistent state. Updated before responding to RPC.
+	store store.Store // Contains log and persistent state.
+
+	opCh chan<- operation
+}
+
+type StateSnapshot struct {
+	Role          Role
+	CurrentLeader string // Current leader. Empty if unknown.
+	CommitIndex   int    // Index of highest log entry known to be commited.
+	CurrentTerm   int    // Latest term server has seen.
+	VotedFor      string // Who received the vote in current term. Empty if none.
 
 }
 
-func (s *State) GetCurrentLeader() string {
-	return s.currentLeader
+type LeaderSnapShot struct {
+	StateSnapshot
+	LeaderNextIndex  map[string]int // Index of the next log to send to each server.
+	LeaderMatchIndex map[string]int // Index of highest log entry known replicated on each server.
 }
 
-func (s *State) SetCurrentLeader(leader string) {
-	s.currentLeader = leader
+func (s *State) New(ctx context.Context, store *store.Store) *State {
+	opCh := make(chan operation)
+	go func() {
+		for {
+			select {
+			case op := <-opCh:
+				s.handleOperation(op)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return &State{
+		role:             Follower,
+		currentLeader:    "",
+		commitIndex:      0,
+		leaderNextIndex:  map[string]int{},
+		leaderMatchIndex: map[string]int{},
+		store:            *store,
+		opCh:             opCh,
+	}
 }
 
-func (s *State) GetRole() Role {
-	return s.role
+func (s *State) Snapshot() StateSnapshot {
+	store := s.store.Snapshot()
+	return StateSnapshot{
+		Role:          s.role,
+		CurrentLeader: s.currentLeader,
+		CommitIndex:   s.commitIndex,
+		CurrentTerm:   store.CurrentTerm,
+		VotedFor:      store.VotedFor,
+	}
 }
 
-func (s *State) SetRole(role Role) {
-	s.role = role
+func (s *State) LeaderSnapshot() LeaderSnapShot {
+	return LeaderSnapShot{
+		StateSnapshot:    s.Snapshot(),
+		LeaderNextIndex:  maps.Clone(s.leaderNextIndex),
+		LeaderMatchIndex: maps.Clone(s.leaderMatchIndex),
+	}
 }
 
-// Latest term server has seen.
-func (s *State) CurrentTerm() int {
-	return s.store.Snapshot().CurrentTerm
-}
+// Get log entry's term. 0 if not found.
+func (s *State) EntryTerm(idx int) int {
+	snap := s.store.Snapshot()
 
-// Set term.
-func (s *State) SetTerm(newTerm int) error {
-	if newTerm <= s.store.Snapshot().CurrentTerm {
-		return nil
+	if len(snap.Log) <= idx {
+		return 0
 	}
 
-	return s.store.WriteTerm(newTerm)
+	return snap.Log[idx].Term
 }
 
-// Who received vote in current term. Empty if none.
-func (s *State) VotedFor() string {
-	return s.store.Snapshot().VotedFor
+func (s *State) BecomeFollower(term int) error {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_: BecomeFollower,
+		term:  term,
+		errCh: errCh,
+	}
+
+	return <-errCh
+}
+
+func (s *State) BecomeCandidate(id string) error {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:  BecomeCandidate,
+		peerId: id,
+		errCh:  errCh,
+	}
+
+	return <-errCh
+}
+
+func (s *State) BecomeLeader(id string) {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:  BecomeLeader,
+		peerId: id,
+		errCh:  errCh,
+	}
+
+	<-errCh
 }
 
 // Updated voted for candidate this term. Reset election timeout.
-func (s *State) VoteFor(candidate string) error {
-	if candidate == s.store.Snapshot().VotedFor {
-		return nil
+func (s *State) CastVote(term int, candidate string) error {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:  CastVote,
+		term:   term,
+		peerId: candidate,
+		errCh:  errCh,
 	}
 
-	return s.store.WriteVotedFor(candidate)
-}
-
-// Index of highest log entry known to be commited.
-func (s *State) CommitIndex() int {
-	return s.commitIndex
-}
-
-// Update last commit index.
-func (s *State) SetCommitIndex(idx int) {
-	s.commitIndex = idx
-}
-
-// Get peer next index or 1 if none.
-func (s *State) GetPeerNextIndex(peer string) int {
-	idx, ok := s.leaderNextIndex[peer]
-	if !ok {
-		return 1
-	}
-	return idx
+	return <-errCh
 }
 
 func (s *State) SetPeerNextIndex(peer string, idx int) {
-	s.leaderNextIndex[peer] = idx
-}
+	errCh := make(chan error)
 
-// Get peer next index or zero if none.
-func (s *State) GetPeerCurrentIndex(peer string) int {
-	idx, ok := s.leaderMatchIndex[peer]
-	if !ok {
-		return 0
+	s.opCh <- operation{
+		type_:  SetPeerNextIndex,
+		peerId: peer,
+		index:  idx,
+		errCh:  errCh,
 	}
-	return idx
+
+	<-errCh
 }
 
 func (s *State) SetPeerCurrentIndex(peer string, idx int) {
-	s.leaderMatchIndex[peer] = idx
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:  SetPeerCurrentIndex,
+		peerId: peer,
+		index:  idx,
+		errCh:  errCh,
+	}
+
+	<-errCh
 }
 
 // Append new entry to the log and return its index.
 //
 // If an entry conflicts with this one, existing entry and the ones after that are deleted.
-func (s *State) AppendEntries(idx int, entries ...store.LogEntry) (int, error) {
-	err := s.store.WriteEntries(idx, entries...)
-	if err != nil {
-		return 0, err
+func (s *State) AppendEntries(leaderCommitIndex int, idx int, entries ...store.LogEntry) error {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:             AppendEntries,
+		index:             idx,
+		leaderCommitIndex: leaderCommitIndex,
+		entries:           entries,
+		errCh:             errCh,
 	}
 
-	return idx + len(entries), nil
-}
-
-// Get log entry's term. -1 if not found.
-func (s *State) EntryTerm(idx int) int {
-	snap := s.store.Snapshot()
-
-	if len(snap.Log) <= idx {
-		return -1
-	}
-
-	return snap.Log[idx].Term
+	return <-errCh
 }

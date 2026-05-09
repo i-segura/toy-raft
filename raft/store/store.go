@@ -45,7 +45,8 @@ func (s *Store) WriteTerm(term int) error {
 	return persist(s.path, &s.data)
 }
 
-func (s *Store) WriteVotedFor(candidate string) error {
+func (s *Store) WriteVotedFor(term int, candidate string) error {
+	s.data.CurrentTerm = term
 	s.data.VotedFor = candidate
 
 	return persist(s.path, &s.data)
