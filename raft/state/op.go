@@ -8,6 +8,7 @@ const (
 	BecomeFollower operationType = iota
 	BecomeCandidate
 	BecomeLeader
+	UpdateLeader
 	CastVote
 	SetPeerNextIndex
 	SetPeerCurrentIndex
@@ -35,6 +36,8 @@ func (s *State) handleOperation(op operation) {
 		s.becomeCandidateOperation(op)
 	case BecomeLeader:
 		s.becomeLeaderOperation(op)
+	case UpdateLeader:
+		s.updateLeader(op)
 	case CastVote:
 		s.castVoteOperation(op)
 	case SetPeerNextIndex:
@@ -55,16 +58,20 @@ func (s *State) becomeFollowerOperation(op operation) {
 }
 
 func (s *State) becomeCandidateOperation(op operation) {
-	store := s.store.Snapshot()
-
 	s.role = Candidate
 
-	op.errCh <- s.store.WriteVotedFor(store.CurrentTerm+1, op.peerId)
+	op.errCh <- s.store.WriteVotedFor(s.store.Data.CurrentTerm+1, op.peerId)
 }
 
 func (s *State) becomeLeaderOperation(op operation) {
 	s.currentLeader = op.peerId
 	s.role = Leader
+
+	op.errCh <- nil
+}
+
+func (s *State) updateLeader(op operation) {
+	s.currentLeader = op.peerId
 
 	op.errCh <- nil
 }

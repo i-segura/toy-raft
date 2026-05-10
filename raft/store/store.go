@@ -9,13 +9,13 @@ import (
 type Store struct {
 	path string
 
-	data Data
+	Data Data
 }
 
 func New(path string) (*Store, error) {
 	p := &Store{
 		path: path,
-		data: Data{
+		Data: Data{
 			CurrentTerm: 0,
 			VotedFor:    "",
 			Log:         []LogEntry{},
@@ -29,7 +29,7 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 
-	err = json.Unmarshal(raw, &p.data)
+	err = json.Unmarshal(raw, &p.Data)
 	if err != nil {
 		return nil, err
 	}
@@ -37,29 +37,25 @@ func New(path string) (*Store, error) {
 	return p, nil
 }
 
-func (s *Store) Snapshot() *Data {
-	return &s.data
-}
-
 func (s *Store) WriteTerm(term int) error {
-	s.data.CurrentTerm = term
-	s.data.VotedFor = ""
+	s.Data.CurrentTerm = term
+	s.Data.VotedFor = ""
 
-	return persist(s.path, &s.data)
+	return persist(s.path, &s.Data)
 }
 
 func (s *Store) WriteVotedFor(term int, candidate string) error {
-	s.data.CurrentTerm = term
-	s.data.VotedFor = candidate
+	s.Data.CurrentTerm = term
+	s.Data.VotedFor = candidate
 
-	return persist(s.path, &s.data)
+	return persist(s.path, &s.Data)
 }
 
 // Write entries into the log.
 //
 // If an entry conflicts with an existig, the log is overwritten from that point onward.
 func (s *Store) WriteEntries(idx int, entries ...LogEntry) error {
-	if len(s.data.Log) < idx {
+	if len(s.Data.Log) < idx {
 		return fmt.Errorf("index is greater than current log")
 	}
 
@@ -67,19 +63,17 @@ func (s *Store) WriteEntries(idx int, entries ...LogEntry) error {
 		return nil
 	}
 
-	if len(s.data.Log) == idx {
-		s.data.Log = append(s.data.Log, entries...)
-		return persist(s.path, &s.data)
-	}
-
-	for replayIdx, replay := range s.data.Log[idx:] {
-		if replay.Term == entries[replayIdx].Term {
-			continue
+	i := 0
+	for ; idx+i < len(s.Data.Log) && i < len(entries); i++ {
+		if s.Data.Log[idx+i].Term != entries[i].Term {
+			break
 		}
-
-		s.data.Log = append(s.data.Log[:idx+replayIdx], entries[replayIdx:]...)
 	}
-	return persist(s.path, &s.data)
+	if i < len(entries) {
+		s.Data.Log = append(s.Data.Log[:idx+i], entries[i:]...)
+	}
+
+	return persist(s.path, &s.Data)
 }
 
 func persist(path string, data *Data) error {

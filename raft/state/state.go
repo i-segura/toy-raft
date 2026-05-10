@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 
+	"github.com/i-segura/toy-raft/raft/protocol"
 	"github.com/i-segura/toy-raft/raft/store"
 )
 
@@ -69,13 +70,12 @@ func New(ctx context.Context, store *store.Store) *State {
 }
 
 func (s *State) Snapshot() StateSnapshot {
-	store := s.store.Snapshot()
 	return StateSnapshot{
 		Role:          s.role,
 		CurrentLeader: s.currentLeader,
 		CommitIndex:   s.commitIndex,
-		CurrentTerm:   store.CurrentTerm,
-		VotedFor:      store.VotedFor,
+		CurrentTerm:   s.store.Data.CurrentTerm,
+		VotedFor:      s.store.Data.VotedFor,
 	}
 }
 
@@ -89,13 +89,31 @@ func (s *State) LeaderSnapshot() LeaderSnapShot {
 
 // Get log entry's term. 0 if not found.
 func (s *State) EntryTerm(idx int) int {
-	snap := s.store.Snapshot()
-
-	if idx < 0 || len(snap.Log) <= idx {
+	if idx < 0 || len(s.store.Data.Log) <= idx {
 		return 0
 	}
 
-	return snap.Log[idx].Term
+	return s.store.Data.Log[idx].Term
+}
+
+// LogLen returns len(log), i.e. the index one past the last entry (next append index).
+func (s *State) LogLen() int {
+	return len(s.store.Data.Log)
+}
+
+// LogCommandsRange returns commands for log indices [from, toInclusive]. Nil if range invalid.
+func (s *State) LogCommandsRange(from, toInclusive int) []protocol.AppendEntry {
+	if from < 0 || toInclusive >= len(s.store.Data.Log) || from > toInclusive {
+		return nil
+	}
+	out := make([]protocol.AppendEntry, 0, toInclusive-from+1)
+	for i := from; i <= toInclusive; i++ {
+		out = append(out, protocol.AppendEntry{
+			Term:    s.store.Data.Log[i].Term,
+			Command: s.store.Data.Log[i].Command,
+		})
+	}
+	return out
 }
 
 func (s *State) BecomeFollower(leader string, term int) error {
@@ -128,6 +146,18 @@ func (s *State) BecomeLeader(id string) {
 
 	s.opCh <- operation{
 		type_:  BecomeLeader,
+		peerId: id,
+		errCh:  errCh,
+	}
+
+	<-errCh
+}
+
+func (s *State) UpdateLeader(id string) {
+	errCh := make(chan error)
+
+	s.opCh <- operation{
+		type_:  UpdateLeader,
 		peerId: id,
 		errCh:  errCh,
 	}

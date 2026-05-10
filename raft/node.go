@@ -1,8 +1,11 @@
 package raft
 
 import (
+	"context"
+	"errors"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/i-segura/toy-raft/raft/client"
@@ -10,6 +13,9 @@ import (
 	"github.com/i-segura/toy-raft/raft/state"
 	"github.com/i-segura/toy-raft/raft/store"
 )
+
+// ErrNotLeader means this node cannot accept proposals in its current role.
+var ErrNotLeader = errors.New("not leader")
 
 type PeerTuple struct {
 	ID     string
@@ -34,6 +40,8 @@ type Node struct {
 
 	electionTimer        *time.Timer
 	leaderHeartbeatTimer *time.Ticker
+
+	proposeMu sync.Mutex
 }
 
 func New(params NodeParams) *Node {
@@ -61,7 +69,7 @@ func (n *Node) Start() {
 		select {
 		case <-n.electionTimer.C:
 			if s.Role == state.Leader {
-				n.electionTimer.Reset(n.electionTimeout)
+				n.resetElectionTimer()
 				continue
 			}
 			n.startElection()
@@ -75,26 +83,21 @@ func (n *Node) Start() {
 }
 
 func (n *Node) HandleAppendEntry(req protocol.AppendEntriesRequest) (*protocol.AppendEntriesResponse, *protocol.Error) {
-	state := n.state.Snapshot()
-	if req.Term < state.CurrentTerm {
-		log.Printf("%s request denied: current term %d, their term %d", state.CurrentTerm, req.Term)
-		return &protocol.AppendEntriesResponse{
-			Term:    state.CurrentTerm,
-			Success: false,
-		}, nil
-	}
-
-	err := n.state.BecomeFollower(req.LeaderID, req.Term)
+	accept, err := n.handleTerm(req.Term, req.LeaderID)
 	if err != nil {
 		return nil, &protocol.Error{
 			Cause: "state error",
 		}
 	}
-
-	n.electionTimer.Reset(n.electionTimeout)
-	if req.Term > state.CurrentTerm {
-		state.CurrentTerm = req.Term
+	if !accept {
+		return &protocol.AppendEntriesResponse{
+			Term:    n.state.Snapshot().CurrentTerm,
+			Success: false,
+		}, nil
 	}
+
+	state := n.state.Snapshot()
+	n.resetElectionTimer()
 
 	reqEntryTerm := n.state.EntryTerm(req.PrevLogIndex)
 	if reqEntryTerm != req.PrevLogTerm {
@@ -107,8 +110,8 @@ func (n *Node) HandleAppendEntry(req protocol.AppendEntriesRequest) (*protocol.A
 	logEntries := []store.LogEntry{}
 	for _, newEntry := range req.Entries {
 		logEntries = append(logEntries, store.LogEntry{
-			Term:    state.CurrentTerm,
-			Command: newEntry,
+			Term:    newEntry.Term,
+			Command: newEntry.Command,
 		})
 	}
 
@@ -126,23 +129,29 @@ func (n *Node) HandleAppendEntry(req protocol.AppendEntriesRequest) (*protocol.A
 }
 
 func (n *Node) HandleRequestVote(req protocol.RequestVoteRequest) (*protocol.RequestVoteResponse, *protocol.Error) {
-	state := n.state.Snapshot()
-	if req.Term < state.CurrentTerm {
-		log.Printf("%s request denied: current term %d, their term %d", state.CurrentTerm, req.Term)
+	accept, err := n.handleTerm(req.Term, "")
+	if err != nil {
+		return nil, &protocol.Error{
+			Cause: "state error",
+		}
+	}
+	if !accept {
 		return &protocol.RequestVoteResponse{
-			Term:        state.CurrentTerm,
+			Term:        n.state.Snapshot().CurrentTerm,
 			VoteGranted: false,
 		}, nil
 	}
-	if req.Term > state.CurrentTerm {
-		state.CurrentTerm = req.Term
-	}
+
+	state := n.state.Snapshot()
 
 	votedForNullOrCandidateID := state.VotedFor == "" || state.VotedFor == req.CandidateID
-	grantVote := votedForNullOrCandidateID && state.CommitIndex <= req.LastLogIndex
+	localLastLogIndex := n.state.LogLen() - 1
+	localLastLogTerm := n.state.EntryTerm(localLastLogIndex)
+	candidateUpToData := req.LastLogTerm > localLastLogTerm || (req.LastLogTerm == localLastLogTerm && req.LastLogIndex >= localLastLogIndex)
+	grantVote := votedForNullOrCandidateID && candidateUpToData
 	if grantVote {
 		err := n.state.CastVote(req.Term, req.CandidateID)
-		n.electionTimer.Reset(n.electionTimeout)
+		n.resetElectionTimer()
 		if err != nil {
 			return nil, &protocol.Error{
 				Cause: "state error",
@@ -151,14 +160,6 @@ func (n *Node) HandleRequestVote(req protocol.RequestVoteRequest) (*protocol.Req
 
 		log.Printf("%s voted for %s", n.id, req.CandidateID)
 	} else {
-		// NOTE: Force term update.
-		err := n.state.CastVote(req.Term, "")
-		n.electionTimer.Reset(n.electionTimeout)
-		if err != nil {
-			return nil, &protocol.Error{
-				Cause: "state error",
-			}
-		}
 		log.Printf("%s vote denied for %s", n.id, req.CandidateID)
 	}
 
@@ -168,14 +169,86 @@ func (n *Node) HandleRequestVote(req protocol.RequestVoteRequest) (*protocol.Req
 	}, nil
 }
 
+// Propose appends cmd on the leader, replicates to a quorum, advances commit, and returns the
+// 0-based log index of the new entry. Serializes with leader heartbeats via proposeMu.
+func (n *Node) Propose(ctx context.Context, cmd any) (int, error) {
+	n.proposeMu.Lock()
+	defer n.proposeMu.Unlock()
+
+	snap := n.state.Snapshot()
+	if snap.Role != state.Leader {
+		return 0, ErrNotLeader
+	}
+
+	newIdx := n.state.LogLen()
+	term := snap.CurrentTerm
+	leaderCommit := snap.CommitIndex
+
+	if err := n.state.AppendEntries(leaderCommit, newIdx, store.LogEntry{
+		Term:    term,
+		Command: cmd,
+	}); err != nil {
+		return 0, err
+	}
+
+	total := len(n.peers) + 1
+	majority := total/2 + 1
+
+	var rep atomic.Int32
+	rep.Store(1)
+
+	var repMu sync.Mutex
+	steppedDown := false
+	stepDownTerm := 0
+
+	var wg sync.WaitGroup
+	for fid, fpeer := range n.peers {
+		wg.Add(1)
+		go func(id string, peer *client.Client) {
+			defer wg.Done()
+			if n.replicateEntryToFollower(ctx, id, peer, newIdx, leaderCommit, &repMu, &steppedDown, &stepDownTerm) {
+				rep.Add(1)
+			}
+		}(fid, fpeer)
+	}
+	wg.Wait()
+
+	repMu.Lock()
+	sd := steppedDown
+	st := stepDownTerm
+	repMu.Unlock()
+
+	if sd {
+		if err := n.state.BecomeFollower("", st); err != nil {
+			log.Printf("%s step down error: %v", n.id, err)
+		}
+		n.resetElectionTimer()
+		return 0, ErrNotLeader
+	}
+
+	if int(rep.Load()) < majority {
+		return 0, errors.New("replication quorum not reached")
+	}
+
+	if err := n.state.AppendEntries(newIdx+1, newIdx+1); err != nil {
+		return 0, err
+	}
+
+	return newIdx, nil
+}
+
 func (n *Node) heartbeatFollowers() {
+	n.proposeMu.Lock()
+	defer n.proposeMu.Unlock()
+
 	state := n.state.LeaderSnapshot()
+	logLen := n.state.LogLen()
 
 	wg := sync.WaitGroup{}
 	for id, peer := range n.peers {
 		peerNextIdx, ok := state.LeaderNextIndex[id]
 		if !ok {
-			peerNextIdx = 1
+			peerNextIdx = logLen
 		}
 
 		peerTerm := n.state.EntryTerm(peerNextIdx - 1)
@@ -186,7 +259,7 @@ func (n *Node) heartbeatFollowers() {
 				PrevLogIndex: peerNextIdx - 1,
 				PrevLogTerm:  peerTerm,
 				LeaderCommit: state.CommitIndex,
-				Entries:      []any{},
+				Entries:      []protocol.AppendEntry{},
 			})
 			if err != nil {
 				log.Printf("error appending entries: %s", err)
@@ -200,7 +273,7 @@ func (n *Node) heartbeatFollowers() {
 					log.Printf("error setting current term: %s", err)
 					return
 				}
-				n.electionTimer.Reset(n.electionTimeout)
+				n.resetElectionTimer()
 				log.Printf("%s became follower", n.id)
 			}
 
@@ -220,50 +293,165 @@ func (n *Node) startElection() {
 	if err != nil {
 		log.Printf("error starting election: %s", err)
 	}
-	n.electionTimer.Reset(n.electionTimeout)
+	n.resetElectionTimer()
 
 	state := n.state.Snapshot()
-	lastCommitTerm := n.state.EntryTerm(state.CommitIndex - 1)
-	responses := map[string]bool{}
+	if len(n.peers) == 0 {
+		n.state.BecomeLeader(n.id)
+		log.Printf("%s became leader (single node)", n.id)
+		n.heartbeatFollowers()
+		return
+	}
+	localLastLogIndex := n.state.LogLen() - 1
+	localLastLogTerm := n.state.EntryTerm(localLastLogIndex)
+
+	total := len(n.peers) + 1
+
+	var rep atomic.Int32
+	rep.Store(1)
+
+	wg := sync.WaitGroup{}
 
 	for id, peer := range n.peers {
-		res, err := peer.RequestVote(protocol.RequestVoteRequest{
-			Term:         state.CurrentTerm,
-			CandidateID:  n.id,
-			LastLogIndex: state.CommitIndex,
-			LastLogTerm:  lastCommitTerm,
-		})
-		if err != nil {
-			log.Printf("error requesting vote: %s", err)
-			return
-		}
-		log.Printf("%s vote response from %s", n.id, id)
-
-		if res.Term > state.CurrentTerm {
-			err := n.state.BecomeFollower("", res.Term)
+		wg.Go(func() {
+			res, err := peer.RequestVote(protocol.RequestVoteRequest{
+				Term:         state.CurrentTerm,
+				CandidateID:  n.id,
+				LastLogIndex: localLastLogIndex,
+				LastLogTerm:  localLastLogTerm,
+			})
 			if err != nil {
-				log.Printf("error setting current term: %s", err)
+				log.Printf("error requesting vote: %s", err)
 				return
 			}
-			log.Printf("%s became follower", n.id)
-			return
-		}
+			log.Printf("%s vote response from %s", n.id, id)
 
-		responses[id] = res.VoteGranted
+			if res.Term > state.CurrentTerm {
+				err := n.state.BecomeFollower("", res.Term)
+				if err != nil {
+					log.Printf("error setting current term: %s", err)
+					return
+				}
+				log.Printf("%s became follower", n.id)
+				return
+			}
+
+			if res.VoteGranted {
+				rep.Add(1)
+			}
+
+		})
 	}
 
-	quorum := 0
-	for _, granted := range responses {
-		if !granted {
+	wg.Wait()
+
+	majority := total/2 + 1
+	if int(rep.Load()) >= majority {
+		n.state.BecomeLeader(n.id)
+		log.Printf("%s became leader", n.id)
+		n.heartbeatFollowers()
+	} else {
+		log.Printf("%s candidate did not receive enough votes: %d/%d", n.id, rep.Load(), majority)
+	}
+
+}
+
+func (n *Node) replicateEntryToFollower(ctx context.Context, id string, peer *client.Client, newIdx, leaderCommit int, repMu *sync.Mutex, steppedDown *bool, stepDownTerm *int) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		repMu.Lock()
+		if *steppedDown {
+			repMu.Unlock()
+			return false
+		}
+		repMu.Unlock()
+
+		ls := n.state.LeaderSnapshot()
+		term := ls.CurrentTerm
+
+		peerNextIdx, ok := ls.LeaderNextIndex[id]
+		if !ok || peerNextIdx > newIdx {
+			peerNextIdx = newIdx
+		}
+		if peerNextIdx < 0 {
+			peerNextIdx = 0
+		}
+
+		prevLogIndex := peerNextIdx - 1
+		prevLogTerm := n.state.EntryTerm(prevLogIndex)
+		entries := n.state.LogCommandsRange(peerNextIdx, newIdx)
+		if len(entries) != newIdx-peerNextIdx+1 {
+			return false
+		}
+
+		res, err := peer.AppendEntries(protocol.AppendEntriesRequest{
+			Term:         term,
+			LeaderID:     n.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: leaderCommit,
+			Entries:      entries,
+		})
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(20 * time.Millisecond):
+			}
 			continue
 		}
-		quorum++
-		if quorum >= len(n.peers)/2 {
-			n.state.BecomeLeader(n.id)
-			log.Printf("%s became leader", n.id)
-			n.heartbeatFollowers()
-			return
+
+		if res.Term > n.state.Snapshot().CurrentTerm {
+			repMu.Lock()
+			if !*steppedDown || res.Term > *stepDownTerm {
+				*steppedDown = true
+				*stepDownTerm = res.Term
+			}
+			repMu.Unlock()
+			return false
+		}
+
+		if res.Success {
+			n.state.SetPeerCurrentIndex(id, newIdx)
+			n.state.SetPeerNextIndex(id, newIdx+1)
+			return true
+		}
+
+		nextDec := peerNextIdx - 1
+		if nextDec < 0 {
+			nextDec = 0
+		}
+		n.state.SetPeerNextIndex(id, nextDec)
+	}
+}
+
+// Handle received term from request. Return false if it should be rejected.
+func (n *Node) handleTerm(peerTerm int, leaderOrNone string) (bool, error) {
+	state := n.state.Snapshot()
+	if peerTerm < state.CurrentTerm {
+		log.Printf("%s request denied: current term %d, theirs %d", n.id, state.CurrentTerm, peerTerm)
+		return false, nil
+	} else if peerTerm > state.CurrentTerm {
+		log.Printf("%s request term update: become follower, current term %d, theirs %d", n.id, state.CurrentTerm, peerTerm)
+		return true, n.state.BecomeFollower(leaderOrNone, peerTerm)
+	}
+	if leaderOrNone != "" {
+		n.state.UpdateLeader(leaderOrNone)
+	}
+	return true, nil
+}
+
+func (n *Node) resetElectionTimer() {
+	if !n.electionTimer.Stop() {
+		select {
+		case <-n.electionTimer.C:
+		default:
 		}
 	}
-	log.Printf("%s candidate did not receive enough votes: %d/%d", n.id, quorum, len(n.peers)/2)
+	n.electionTimer.Reset(n.electionTimeout)
 }
