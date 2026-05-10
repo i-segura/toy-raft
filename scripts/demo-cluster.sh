@@ -4,7 +4,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_DIR="${ROOT}/.demo-bin"
+BIN_DIR="${ROOT}/bin"
 mkdir -p "${BIN_DIR}"
 
 TOY_RAFT="${BIN_DIR}/toy-raft"
