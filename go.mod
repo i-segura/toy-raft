@@ -1,3 +1,3 @@
 module github.com/i-segura/toy-raft
 
-go 1.26.3
+go 1.26
